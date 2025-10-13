@@ -1,0 +1,173 @@
+import sys
+import select
+import signal
+import serial
+import threading
+from time import sleep, time
+from gpiozero import LED, Button, DigitalInputDevice
+from RPi import GPIO
+
+# === GPIO CONFIG ===
+output_pins = {
+    14: 17,
+    13: 18,
+    11: 19,
+    5: 20,
+}
+
+reset_button_pin = 7
+led_pin = 22      # Feedback LED
+control_pin = 12  # GPIO12 LOW → output off timer
+
+# === INTERNAL STATE ===
+barcode_pin_map = {}  # volatile, no memory
+gpio_objects = {}
+scanner_enabled = True
+assign_mode = None
+
+# === GPIO SETUP ===
+GPIO.setwarnings(False)
+GPIO.setmode(GPIO.BCM)
+
+assignment_inputs = {pin: Button(pin, pull_up=True, bounce_time=0.1) for pin in output_pins}
+reset_button = Button(reset_button_pin, pull_up=True, bounce_time=0.1)
+feedback_led = LED(led_pin)
+control_input = DigitalInputDevice(control_pin, pull_up=True)
+
+# Track button edge detection
+for btn in assignment_inputs.values():
+    btn.handled = False
+reset_button.handled = False
+
+# === SERIAL CONFIG (RS232 scanner) ===
+try:
+    ser = serial.Serial("/dev/ttyUSB0", baudrate=9600, timeout=0.1)
+    print("[INFO] RS232 scanner connected at /dev/ttyUSB0")
+except Exception as e:
+    print(f"[WARN] RS232 scanner not available: {e}")
+    ser = None
+
+# === FUNCTIONS ===
+def blink_feedback():
+    feedback_led.on()
+    sleep(0.2)
+    feedback_led.off()
+
+def switch_output(barcode):
+    """Turn ON output until GPIO12 is LOW for 10 sec, disable scanner meanwhile"""
+    global scanner_enabled
+    short_code = barcode[:11]
+    if short_code in barcode_pin_map:
+        pin = barcode_pin_map[short_code]
+        if pin not in gpio_objects:
+            gpio_objects[pin] = LED(pin)
+        gpio_objects[pin].on()
+        scanner_enabled = False
+        print(f"[ACTION] Barcode {short_code} → GPIO{pin} ON")
+
+        start_low = None
+        while True:
+            if not control_input.value:  # GPIO12 LOW
+                if start_low is None:
+                    start_low = time()
+                elif time() - start_low >= 10:
+                    break
+            else:
+                start_low = None
+            sleep(0.05)
+
+        gpio_objects[pin].off()
+        print(f"[INFO] GPIO{pin} OFF after GPIO12 LOW 10s")
+        sleep(10)  # Keep scanner off for cooldown
+        scanner_enabled = True
+        print("[INFO] Scanner re-enabled after cooldown")
+    else:
+        print(f"[WARN] Unknown barcode {short_code}")
+
+def assign_barcode(short_code, pin):
+    barcode_pin_map[short_code] = pin
+    print(f"[ASSIGN] {short_code} → GPIO{pin}")
+    blink_feedback()  # Feedback LED
+
+def reset_assignments():
+    barcode_pin_map.clear()
+    print("[RESET] All assignments cleared")
+    blink_feedback()  # Feedback LED
+
+def process_barcode(barcode):
+    global assign_mode
+    if not scanner_enabled:
+        print("[INFO] Scanner temporarily disabled, ignoring scan")
+        return
+
+    short_code = barcode[:11]
+    if assign_mode:
+        assign_barcode(short_code, assign_mode)
+        assign_mode = None
+    else:
+        switch_output(barcode)
+
+# === THREADS FOR SCANNERS ===
+def read_stdin_loop():
+    while True:
+        if select.select([sys.stdin], [], [], 0.1)[0]:
+            barcode = sys.stdin.readline().strip()
+            if barcode:
+                process_barcode(barcode)
+
+def read_serial_loop():
+    if not ser:
+        return
+    while True:
+        try:
+            line = ser.readline().decode("utf-8").strip()
+            if line:
+                process_barcode(line)
+        except Exception as e:
+            print(f"[ERROR] Serial read: {e}")
+            break
+
+# === CLEANUP ===
+def cleanup_and_exit(*args):
+    print("\n[EXIT] Cleaning up GPIO...")
+    for led in gpio_objects.values():
+        led.off()
+    feedback_led.off()
+    GPIO.cleanup()
+    sys.exit(0)
+
+# === MAIN LOOP ===
+def main():
+    global assign_mode
+    print("[READY] Press buttons or scan barcode (RS232 + Bluetooth). Ctrl+C to stop.")
+
+    signal.signal(signal.SIGINT, cleanup_and_exit)
+    signal.signal(signal.SIGTERM, cleanup_and_exit)
+
+    threading.Thread(target=read_stdin_loop, daemon=True).start()
+    threading.Thread(target=read_serial_loop, daemon=True).start()
+
+    while True:
+        # Handle assign buttons (edge detection)
+        for btn_pin, btn in assignment_inputs.items():
+            if btn.is_pressed and not btn.handled:
+                print(f"[BUTTON] Assign button GPIO{btn_pin} pressed → Output GPIO{output_pins[btn_pin]}")
+                assign_mode = output_pins[btn_pin]
+                blink_feedback()  # Feedback LED
+                btn.handled = True
+            elif not btn.is_pressed:
+                btn.handled = False
+
+        # Handle reset button (edge detection)
+        if reset_button.is_pressed and not reset_button.handled:
+            print(f"[BUTTON] Reset button GPIO{reset_button_pin} pressed")
+            reset_assignments()
+            assign_mode = None
+            reset_button.handled = True
+        elif not reset_button.is_pressed:
+            reset_button.handled = False
+
+        sleep(0.05)
+
+if __name__ == "__main__":
+    main()
